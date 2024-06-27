@@ -12,6 +12,7 @@ import torch.utils
 # import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
+from torch.cuda.amp import GradScaler, autocast
 
 from models.macro_models import EvoNetwork
 from models.micro_models import NetworkCIFAR as Network
@@ -38,9 +39,6 @@ def main(genome, epochs, search_space='micro',
     log_format = '%(asctime)s %(message)s'
     logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                         format=log_format, datefmt='%m/%d %I:%M:%S %p')
-    # fh = logging.FileHandler(os.path.join(save_pth, 'log.txt'))
-    # fh.setFormatter(logging.Formatter(log_format))
-    # logging.getLogger().addHandler(fh)
 
     # ---- parameter values setting ----- #
     CIFAR_CLASSES = 10
@@ -172,100 +170,44 @@ def main(genome, epochs, search_space='micro',
         'flops': n_flops,
     }
 
-
-# def train(train_queue, model, criterion, optimizer, params):
-#     objs = utils.AvgrageMeter()
-#     top1 = utils.AvgrageMeter()
-#     top5 = utils.AvgrageMeter()
-#     model.train()
-#
-#     for step, (input, target) in enumerate(train_queue):
-#         input = Variable(input).cuda()
-#         target = Variable(target).cuda(async=True)
-#
-#         optimizer.zero_grad()
-#         if params['auxiliary']:
-#             logits, logits_aux = model(input)
-#         else:
-#             logits, _ = model(input)
-#
-#         loss = criterion(logits, target)
-#         if params['auxiliary']:
-#             loss_aux = criterion(logits_aux, target)
-#             loss += params['auxiliary_weight'] * loss_aux
-#         loss.backward()
-#         nn.utils.clip_grad_norm(model.parameters(), params['grad_clip'])
-#         optimizer.step()
-#
-#         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-#         n = input.size(0)
-#         objs.update(loss.data[0], n)
-#         top1.update(prec1.data[0], n)
-#         top5.update(prec5.data[0], n)
-#
-#         # if step % params['report_freq'] == 0:
-#         #     logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
-#
-#     return top1.avg, objs.avg
-
 # Training
-def train(train_queue, net, criterion, optimizer, params):
+def train(train_queue, net, criterion, optimizer, params, device):
     net.train()
     train_loss = 0
     correct = 0
     total = 0
+    scaler = GradScaler()
 
     for step, (inputs, targets) in enumerate(train_queue):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
-        outputs, outputs_aux = net(inputs)
-        loss = criterion(outputs, targets)
+        
+        # Forward pass with mixed precision
+        with autocast():
+            outputs, outputs_aux = net(inputs)
+            loss = criterion(outputs, targets)
 
-        if params['auxiliary']:
-            loss_aux = criterion(outputs_aux, targets)
-            loss += params['auxiliary_weight'] * loss_aux
+            if params['auxiliary']:
+                loss_aux = criterion(outputs_aux, targets)
+                loss += params['auxiliary_weight'] * loss_aux
 
-        loss.backward()
+        # Backward pass with mixed precision
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(net.parameters(), params['grad_clip'])
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         train_loss += loss.item()
         _, predicted = outputs.max(1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-    #     if step % args.report_freq == 0:
-    #         logging.info('train %03d %e %f', step, train_loss/total, 100.*correct/total)
-    #
-    # logging.info('train acc %f', 100. * correct / total)
+        if step % params['log_interval'] == 0:
+            print(f"Step {step}/{len(train_queue)}, Loss: {train_loss/(step+1):.4f}, Accuracy: {100.*correct/total:.2f}%")
 
-    return 100.*correct/total, train_loss/total
+    return 100. * correct / total, train_loss / total
 
-
-# def infer(valid_queue, model, criterion):
-#     objs = utils.AvgrageMeter()
-#     top1 = utils.AvgrageMeter()
-#     top5 = utils.AvgrageMeter()
-#     model.eval()
-#
-#     for step, (input, target) in enumerate(valid_queue):
-#         input = Variable(input, volatile=True).cuda()
-#         target = Variable(target, volatile=True).cuda(async=True)
-#
-#         logits, _ = model(input)
-#
-#         loss = criterion(logits, target)
-#
-#         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-#         n = input.size(0)
-#         objs.update(loss.data[0], n)
-#         top1.update(prec1.data[0], n)
-#         top5.update(prec5.data[0], n)
-#
-#         # if step % params['report_freq'] == 0:
-#         #     logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
-#
-#     return top1.avg, objs.avg
 
 
 def infer(valid_queue, net, criterion):
@@ -285,11 +227,7 @@ def infer(valid_queue, net, criterion):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            # if step % args.report_freq == 0:
-            #     logging.info('valid %03d %e %f', step, test_loss/total, 100.*correct/total)
-
     acc = 100.*correct/total
-    # logging.info('valid acc %f', 100. * correct / total)
 
     return acc, test_loss/total
 
@@ -301,7 +239,3 @@ if __name__ == "__main__":
     print(main(genome=DARTS_V2, epochs=20, save='DARTS_V2_16', seed=1, init_channels=16,
                auxiliary=False, cutout=False, drop_path_prob=0.0))
     print('Time elapsed = {} mins'.format((time.time() - start)/60))
-    # start = time.time()
-    # print(main(genome=DARTS_V2, epochs=20, save='DARTS_V2_32', seed=1, init_channels=32))
-    # print('Time elapsed = {} mins'.format((time.time() - start) / 60))
-
